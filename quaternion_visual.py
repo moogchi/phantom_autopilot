@@ -9,10 +9,10 @@ import serial.tools.list_ports
 def quaternion_to_rotation_matrix(q):
     """
     Convert quaternion to rotation matrix.
-    q = [w, x, y, z] or [x, y, z, w] depending on format
+    q = [w, x, y, z] format
     """
-    # Assuming format is [x, y, z, w] based on the data
-    x, y, z, w = q
+    # Format is [w, x, y, z] from STM32
+    w, x, y, z = q
     
     # Normalize quaternion
     norm = np.sqrt(w*w + x*x + y*y + z*z)
@@ -98,7 +98,7 @@ class QuaternionVisualizer:
                 self.ser = None
         
         # Current quaternion
-        self.quaternion = np.array([0.0, 0.0, 0.0, 1.0])  # [x, y, z, w]
+        self.quaternion = np.array([1.0, 0.0, 0.0, 0.0])  # [w, x, y, z]
         
         # Setup plot
         self.fig = plt.figure(figsize=(10, 8))
