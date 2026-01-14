@@ -1,0 +1,11 @@
+../Core/Src/main.c:96:5:main	19
+../Core/Src/main.c:281:6:SystemClock_Config	3
+../Core/Src/main.c:325:13:MX_USART1_UART_Init	2
+../Core/Src/main.c:352:13:MX_USART2_UART_Init	2
+../Core/Src/main.c:380:13:MX_GPIO_Init	1
+../Core/Src/main.c:414:6:EKF_Predict	1
+../Core/Src/main.c:448:6:EKF_Update	3
+../Core/Src/main.c:506:6:EKF_Init	4
+../Core/Src/main.c:533:6:HAL_UART_RxCpltCallback	4
+../Core/Src/main.c:548:6:logging	1
+../Core/Src/main.c:559:6:Error_Handler	1
