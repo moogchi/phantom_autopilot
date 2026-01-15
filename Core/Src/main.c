@@ -21,6 +21,8 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+
+#define MESSAGE_LEN 256
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 /* USER CODE END Includes */
@@ -124,6 +126,15 @@ int main(void) {
   EKF_Init(&ekf);
   float sim_time, ax, ay, az, gx, gy, gz;
   float last_time = 0;
+  // PID Gains
+  // experimental values
+  float kp_r = 0.4f;
+  float ki_r = 0.0f;
+  float kd_r = 0.45f;
+
+  float kp_p = 0.2f;
+  float ki_p = 0.0f;
+  float kd_p = 0.1f;
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -145,8 +156,8 @@ int main(void) {
 
         // Calculate time difference
         float dt = sim_time - last_time;
-        if (dt < 0.001f || dt > 0.05f)
-          dt = 0.01f; // safety net
+        // if (dt < 0.001f || dt > 0.05f)
+        //   dt = 0.01f; // safety net
         last_time = sim_time;
 
         // Run the Math
@@ -180,14 +191,6 @@ int main(void) {
         float cosy_cosp = 1.0f - 2.0f * (qy * qy + qz * qz);
         //             float yaw_est = atan2f(siny_cosp, cosy_cosp);
 
-        // PID Gains
-        // experimental values
-        float kp_r = 0.4f;
-        float kd_r = 0.45f;
-
-        float kp_p = 0.6f;
-        float kd_p = 0.25f;
-
         //			 float kp_y = 0.5f;
         //			 float ki_y = 0.0f;
         //			 float kd_y = 0.1f;
@@ -218,15 +221,15 @@ int main(void) {
         if (ekf.pitch_integral < -2.0f)
           ekf.pitch_integral = -2.0f;
 
-        float ki_r = 0.1f; // start small
-        float ki_p = 0.1f;
-
         float aileron_cmd =
             -(kp_r * roll_error + ki_r * ekf.roll_integral - kd_r * roll_rate);
-        aileron_cmd = aileron_cmd * (-1.0f);
+        // Remove double negation - test if this fixes roll direction
+        // aileron_cmd = aileron_cmd * (-1.0f);
+
         float elevator_cmd =
             kp_p * pitch_error + ki_p * ekf.pitch_integral - kd_p * pitch_rate;
-        elevator_cmd = elevator_cmd * (-1.0f);
+        // Remove double negation - test if this fixes pitch direction
+        // elevator_cmd = elevator_cmd * (-1.0f);
 
         // yaw pid
         //			 float yaw_error = yaw_est; //goal_is 0.0f
@@ -256,16 +259,19 @@ int main(void) {
         //			 if (rudder_cmd > 1.0f) rudder_cmd = 1.0f;
         //			 if (rudder_cmd < -1.0f) rudder_cmd = -1.0f;
 
-        char control_msg[128];
-        snprintf(control_msg, sizeof(control_msg), "%.4f,%.4f\n", aileron_cmd,
-                 elevator_cmd);
-        HAL_UART_Transmit(&huart2, (uint8_t *)control_msg, strlen(control_msg),
-                          10);
+        // DISABLED: Testing orientation sensing without control output
+        // char control_msg[MESSAGE_LEN];
+        // snprintf(control_msg, sizeof(control_msg), "%.4f,%.4f\n", aileron_cmd,
+        //          elevator_cmd);
+        // HAL_UART_Transmit(&huart2, (uint8_t *)control_msg, strlen(control_msg),
+        //                   10);
 
-        char quaternion[128];
-        snprintf(quaternion, sizeof(quaternion), "%.4f, %.4f, %.4f, %4f\n",
-                 ekf.q[0], ekf.q[1], ekf.q[2], ekf.q[3]);
-        logging(quaternion);
+        char debug_msg[MESSAGE_LEN];
+        snprintf(debug_msg, sizeof(debug_msg),
+                 "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f",
+                 ekf.q[0], ekf.q[1], ekf.q[2], ekf.q[3], ax, ay, az, gx, gy, gz,
+                 sim_time, dt);
+        logging(debug_msg);
       }
     }
     /* USER CODE END WHILE */
@@ -446,13 +452,18 @@ void EKF_Predict(EKF_State_t *state, float gi, float gj, float gk, float dt) {
   state->q[3] /= msg;
 }
 void EKF_Update(EKF_State_t *state, float ai, float aj, float ak) {
-  // normalize data
+  // normalize data - convert from m/s² to g-units
   float a_mag = sqrtf(ai * ai + aj * aj + ak * ak);
-  if (fabsf(a_mag - 1.0f) > 0.15f) {
-    return; // ignore accel update during maneuver
-  }
   if (a_mag < 0.01f)
     return; // avoid divide by zero.
+
+  // Convert to g-units (divide by 9.8) before checking magnitude
+  float a_mag_g = a_mag / 9.8f;
+  if (fabsf(a_mag_g - 1.0f) > 0.15f) {
+    return; // ignore accel update during maneuver (>0.15g deviation)
+  }
+
+  // Normalize to unit vector
   ai /= a_mag;
   aj /= a_mag;
   ak /= a_mag;
@@ -461,10 +472,12 @@ void EKF_Update(EKF_State_t *state, float ai, float aj, float ak) {
   float qi = state->q[1];
   float qj = state->q[2];
   float qk = state->q[3];
-  // predict gravity
+  // predict gravity direction in body frame
+  // FlightGear: Z-up, so gravity is in -Z direction
   float hi = 2.0f * (qi * qk - qw * qj);
   float hj = 2.0f * (qw * qi + qj * qk);
-  float hk = qw * qw - qi * qi - qj * qj + qk * qk;
+  float hk =
+      -(qw * qw - qi * qi - qj * qj + qk * qk); // Negate for Z-up convention
   // error vector
   float ex = (hj * ak - hk * aj);
   float ey = (hk * ai - hi * ak);
@@ -546,7 +559,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
 }
 
 void logging(char *log_msg) {
-  char out_msg[128];
+  char out_msg[MESSAGE_LEN];
   snprintf(out_msg, sizeof(out_msg), "%s\n", log_msg);
   HAL_UART_Transmit(&huart1, (uint8_t *)out_msg, strlen(out_msg), 10);
 }
