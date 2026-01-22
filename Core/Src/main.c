@@ -15,39 +15,48 @@
  *
  ******************************************************************************
  */
+#define MESSAGE_LEN 256
+#define RX_DMA_SIZE 256
+
+// covariance define so i don't mess up the index
+#define IND_ANGLE_X 0
+#define IND_ANGLE_Y 1
+#define IND_ANGLE_Z 2
+#define IND_BIAS_X 3
+#define IND_BIAS_Y 4
+#define IND_BIAS_Z 5
+
+// PID define so i don't mess up the index
+#define KP_R [0][0]
+#define KI_R [0][1]
+#define KD_R [0][2]
+#define KP_P [1][0]
+#define KI_P [1][1]
+#define KD_P [1][2]
+#define KP_Y [2][0]
+#define KI_Y [2][1]
+#define KD_Y [2][2]
+
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include <math.h>
-#include <stdio.h>
-#include <string.h>
 
-#define MESSAGE_LEN 256
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-typedef struct { // quaternion coordinate w+xi+yj+zk
-  float w;
-  float i;
-  float j;
-  float k;
-} Quat_t;
 typedef struct {
-  float q[4];    // store quaternion
-  float bias[3]; // gyro bias (booty cheeks)
-  float P[7][7]; // uncertainty 1-4 is for orientation uncertainty(w,i,j,k) the
-                 // rest is for gyro bias(i,j,k)
-
-  // PID State Variables
-  float roll_integral;
-  float pitch_integral;
-  float yaw_integral;
-  float last_roll_error;
-  float last_pitch_error;
-  float last_yaw_error;
+  float q[4];      // store quaternion
+  float bias[3];   // gyro bias (booty cheeks)
+  float P[6][6];   // uncertainty 1-3 is rot error
+                   // rest is for gyro bias(i,j,k)
+  float PID[3][3]; // just for neatness
 } EKF_State_t;
 /* USER CODE END PTD */
 
@@ -62,18 +71,31 @@ typedef struct {
 /* Private variables ---------------------------------------------------------*/
 UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
+DMA_HandleTypeDef hdma_usart1_tx;
+DMA_HandleTypeDef hdma_usart2_tx;
+DMA_HandleTypeDef hdma_usart2_rx;
 
 /* USER CODE BEGIN PV */
-// priv var
-uint8_t rx_byte;        // temp variable for 1 char
-uint8_t rx_buffer[128]; // full message storage
-int rx_index = 0;       // current pos in rx_buffer
-uint8_t data_ready = 0; // flag to check if we have full packet
-EKF_State_t ekf;        // Global
-
+// priv var// RX - Circular DMA
+static uint8_t rx_dma_buf[RX_DMA_SIZE];
+volatile uint16_t rx_last_pos = 0;
+static uint8_t rx_buffer[MESSAGE_LEN]; // parsed packet storage
+static volatile uint8_t data_ready = 0;
+static char uart2_tx_buffer[MESSAGE_LEN];
+static char uart1_tx_buffer[MESSAGE_LEN];
+static volatile uint8_t uart2_tx_busy = 0;
+static volatile uint8_t uart1_tx_busy = 0;
+static EKF_State_t
+    ekf; // Global just stores any values that must stay outside main scope
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
+static void MX_USART2_UART_Init(void);
+static void MX_USART1_UART_Init(void);
+/* USER CODE BEGIN PFP */
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART2_UART_Init(void);
@@ -81,13 +103,16 @@ static void MX_USART1_UART_Init(void);
 void EKF_Predict(EKF_State_t *state, float gi, float gj, float gk, float dt);
 void EKF_Update(EKF_State_t *state, float ai, float aj, float ak);
 void EKF_Init(EKF_State_t *state);
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart);
-void logging(char *log_msg);
-/* USER CODE BEGIN PFP */
+float compute_elevator(EKF_State_t *state);
+float compute_aileron(EKF_State_t *state);
+void quaternion_to_body_x(float q[4], float x_body[3]);
+void quaternion_to_body_y(float q[4], float y_body[3]);
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart);
+void uart_output(uint8_t port, char *msg);
+void process_rx_data(uint16_t old_pos, uint16_t new_pos);
 /* USER CODE END PFP */
 
-/* Private user code
-   ---------------------------------------------------------*/
+/* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 /* USER CODE END 0 */
 
@@ -117,166 +142,117 @@ int main(void) {
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_USART2_UART_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
   // listen for 1 byte, save to rx_byte, and interrupt when done
-  HAL_UART_Receive_IT(&huart2, &rx_byte, 1);
+  HAL_UART_Receive_DMA(&huart2, rx_dma_buf, RX_DMA_SIZE);
+  __HAL_UART_ENABLE_IT(&huart2, UART_IT_IDLE);
 
   EKF_Init(&ekf);
   float sim_time, ax, ay, az, gx, gy, gz;
   float last_time = 0;
-  // PID Gains
-  // experimental values
-  float kp_r = 0.4f;
-  float ki_r = 0.0f;
-  float kd_r = 0.45f;
 
-  float kp_p = 0.2f;
-  float ki_p = 0.0f;
-  float kd_p = 0.1f;
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1) {
-    // 1. Did we get a packet?
-    if (data_ready == 1) {
-      data_ready = 0; // Reset flag
+    if (data_ready) {
+      data_ready = 0;
 
-      // 2. Try to read the 7 numbers
-      // Format: Time, Ax, Ay, Az, Gx, Gy, Gz
-      int items = sscanf((char *)rx_buffer, "%f,%f,%f,%f,%f,%f,%f", &sim_time,
-                         &ax, &ay, &az, &gx, &gy, &gz);
+      char *ptr = (char *)rx_buffer;
+      char *end;
 
-      // 3. Only blink if the packet is PERFECT (items == 7)
-      if (items == 7) {
-        // lwk just there to check if it calculating
-        HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
-
-        // Calculate time difference
-        float dt = sim_time - last_time;
-        // if (dt < 0.001f || dt > 0.05f)
-        //   dt = 0.01f; // safety net
-        last_time = sim_time;
-
-        // Run the Math
-        EKF_Predict(&ekf, gx, gy, gz, dt);
-        EKF_Update(&ekf, ax, ay, az);
-
-        if (isnan(ekf.q[0]) || isnan(ekf.q[1]) || isnan(ekf.q[2]) ||
-            isnan(ekf.q[3])) {
-          // Reset EKF if it breaks
-          EKF_Init(&ekf);
-          continue; // Skip this iteration
-        }
-
-        float qw = ekf.q[0];
-        float qx = ekf.q[1];
-        float qy = ekf.q[2];
-        float qz = ekf.q[3];
-
-        float sinr_cosp = 2.0f * (qw * qx + qy * qz);
-        float cosr_cosp = 1.0f - 2.0f * (qx * qx + qy * qy);
-        float roll_est = atan2f(sinr_cosp, cosr_cosp);
-
-        float sinp = 2.0f * (qw * qy - qz * qx);
-        if (sinp > 1.0f)
-          sinp = 1.0f;
-        if (sinp < -1.0f)
-          sinp = -1.0f;
-        float pitch_est = asinf(sinp);
-
-        float siny_cosp = 2.0f * (qw * qz + qx * qy);
-        float cosy_cosp = 1.0f - 2.0f * (qy * qy + qz * qz);
-        //             float yaw_est = atan2f(siny_cosp, cosy_cosp);
-
-        //			 float kp_y = 0.5f;
-        //			 float ki_y = 0.0f;
-        //			 float kd_y = 0.1f;
-
-        // roll pid
-        float roll_error = roll_est; // goal is 0.0f
-
-        float roll_rate = gx;
-        ekf.last_roll_error = roll_error;
-
-        // pitch pid
-        float target_pitch = 0.0f;
-        float pitch_rate = gy * cos(roll_est) - gz * sin(roll_est);
-        float pitch_error = target_pitch - pitch_est; // goal_is 0.0f
-
-        ekf.last_pitch_error = pitch_error;
-
-        ekf.roll_integral += roll_error * dt;
-        ekf.pitch_integral += pitch_error * dt;
-
-        // anti-windup
-        if (ekf.roll_integral > 2.0f)
-          ekf.roll_integral = 2.0f;
-        if (ekf.roll_integral < -2.0f)
-          ekf.roll_integral = -2.0f;
-        if (ekf.pitch_integral > 2.0f)
-          ekf.pitch_integral = 2.0f;
-        if (ekf.pitch_integral < -2.0f)
-          ekf.pitch_integral = -2.0f;
-
-        float aileron_cmd =
-            -(kp_r * roll_error + ki_r * ekf.roll_integral - kd_r * roll_rate);
-        // Remove double negation - test if this fixes roll direction
-        // aileron_cmd = aileron_cmd * (-1.0f);
-
-        float elevator_cmd =
-            kp_p * pitch_error + ki_p * ekf.pitch_integral - kd_p * pitch_rate;
-        // Remove double negation - test if this fixes pitch direction
-        // elevator_cmd = elevator_cmd * (-1.0f);
-
-        // yaw pid
-        //			 float yaw_error = yaw_est; //goal_is 0.0f
-        //
-        //			 // integral with anti windup
-        //			 ekf.yaw_integral += yaw_error * dt;
-        //			 if (ekf.yaw_integral > 2.0f) ekf.yaw_integral
-        //= 2.0f; 			 if (ekf.yaw_integral < -2.0f)
-        // ekf.yaw_integral = -2.0f; 			 float yaw_derivative =
-        // 0.0f; 			 float yaw_rate = gz;
-        // float rudder_cmd = -(kp_y
-        //* yaw_error
-        //			                    + ki_y * ekf.yaw_integral
-        //			                    - kd_y * yaw_rate);
-        //
-        //			 ekf.last_yaw_error = yaw_error;
-
-        // clamping
-        if (aileron_cmd > 1.0f)
-          aileron_cmd = 1.0f;
-        if (aileron_cmd < -1.0f)
-          aileron_cmd = -1.0f;
-        if (elevator_cmd > 1.0f)
-          elevator_cmd = 1.0f;
-        if (elevator_cmd < -1.0f)
-          elevator_cmd = -1.0f;
-        //			 if (rudder_cmd > 1.0f) rudder_cmd = 1.0f;
-        //			 if (rudder_cmd < -1.0f) rudder_cmd = -1.0f;
-
-        // DISABLED: Testing orientation sensing without control output
-        // char control_msg[MESSAGE_LEN];
-        // snprintf(control_msg, sizeof(control_msg), "%.4f,%.4f\n", aileron_cmd,
-        //          elevator_cmd);
-        // HAL_UART_Transmit(&huart2, (uint8_t *)control_msg, strlen(control_msg),
-        //                   10);
-
-        char debug_msg[MESSAGE_LEN];
-        snprintf(debug_msg, sizeof(debug_msg),
-                 "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f",
-                 ekf.q[0], ekf.q[1], ekf.q[2], ekf.q[3], ax, ay, az, gx, gy, gz,
-                 sim_time, dt);
-        logging(debug_msg);
+      // Parse all 7 fields
+      sim_time = strtof(ptr, &end);
+      if (*end != ',' ||
+          end == ptr) { // Add check: end == ptr means no conversion
+        EKF_Init(&ekf); // Reset on bad packet
+        continue;
       }
+      ptr = end + 1;
+
+      ax = strtof(ptr, &end);
+      if (*end != ',' || end == ptr) {
+        EKF_Init(&ekf);
+        continue;
+      }
+      ptr = end + 1;
+
+      ay = strtof(ptr, &end);
+      if (*end != ',' || end == ptr) {
+        EKF_Init(&ekf);
+        continue;
+      }
+      ptr = end + 1;
+
+      az = strtof(ptr, &end);
+      if (*end != ',' || end == ptr) {
+        EKF_Init(&ekf);
+        continue;
+      }
+      ptr = end + 1;
+
+      gx = strtof(ptr, &end);
+      if (*end != ',' || end == ptr) {
+        EKF_Init(&ekf);
+        continue;
+      }
+      ptr = end + 1;
+
+      gy = strtof(ptr, &end);
+      if (*end != ',' || end == ptr) {
+        EKF_Init(&ekf);
+        continue;
+      }
+      ptr = end + 1;
+
+      gz = strtof(ptr, &end);
+      if (end == ptr) { // Last field - no comma check needed
+        EKF_Init(&ekf);
+        continue;
+      }
+
+      // blink to show valid packet
+      HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
+
+      // compute time difference
+      float dt = sim_time - last_time;
+      if (dt <= 0.0f || dt > 0.05f)
+        dt = 0.025f;
+      last_time = sim_time;
+
+      // EKF
+      EKF_Predict(&ekf, gx, gy, gz, dt);
+      EKF_Update(&ekf, ax, ay, az);
+
+      if (isnan(ekf.q[0])) {
+        EKF_Init(&ekf);
+        continue;
+      }
+
+      float aileron_cmd = compute_aileron(&ekf);
+      float elevator_cmd = compute_elevator(&ekf);
+
+      char cmd_msg[MESSAGE_LEN];
+      snprintf(cmd_msg, sizeof(cmd_msg), "%.4f,%.4f\n", aileron_cmd,
+               elevator_cmd);
+      uart_output(2, cmd_msg);
+
+      char debug_msg[MESSAGE_LEN];
+      snprintf(debug_msg, sizeof(debug_msg),
+               "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f",
+               ekf.q[0], ekf.q[1], ekf.q[2], ekf.q[3], ax, ay, az, gx, gy, gz,
+               sim_time, dt);
+      uart_output(1, debug_msg);
     }
-    /* USER CODE END WHILE */
-    /* USER CODE BEGIN 3 */
   }
+
+  /* USER CODE END WHILE */
+
+  /* USER CODE BEGIN 3 */
   /* USER CODE END 3 */
 }
 
@@ -379,6 +355,27 @@ static void MX_USART2_UART_Init(void) {
 }
 
 /**
+ * Enable DMA controller clock
+ */
+static void MX_DMA_Init(void) {
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA1_CLK_ENABLE();
+  __HAL_RCC_DMA2_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA1_Stream5_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Stream5_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream5_IRQn);
+  /* DMA1_Stream6_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Stream6_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream6_IRQn);
+  /* DMA2_Stream7_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Stream7_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream7_IRQn);
+}
+
+/**
  * @brief GPIO Initialization Function
  * @param None
  * @retval None
@@ -418,20 +415,20 @@ static void MX_GPIO_Init(void) {
 // okay to see if we can trust gyro gng i need to predict where im gonna be
 // first
 void EKF_Predict(EKF_State_t *state, float gi, float gj, float gk, float dt) {
-  // ekf is too confidenct if its just set as 1
-  state->P[0][0] += 0.001f * dt;
-  state->P[1][1] += 0.001f * dt;
-  state->P[2][2] += 0.001f * dt;
-  state->P[3][3] += 0.001f * dt;
+  // diangonal filter for now
+  state->P[0][0] += 0.01f * dt;
+  state->P[1][1] += 0.01f * dt;
+  state->P[2][2] += 0.01f * dt;
+  state->P[3][3] += 1e-6f * dt;
   state->P[4][4] += 1e-6f * dt;
   state->P[5][5] += 1e-6f * dt;
-  state->P[6][6] += 1e-6f * dt;
 
   // subtract bias :)
   float ui = gi - state->bias[0];
   float uj = gj - state->bias[1];
   float uk = gk - state->bias[2];
-  // grab quaternion values into a float so its easy to read
+
+  // copy quaternion values into a variable so its easy to use
   float qw = state->q[0];
   float qi = state->q[1];
   float qj = state->q[2];
@@ -442,14 +439,14 @@ void EKF_Predict(EKF_State_t *state, float gi, float gj, float gk, float dt) {
   state->q[1] += 0.5f * dt * (qw * ui + qj * uk - qk * uj);
   state->q[2] += 0.5f * dt * (qw * uj - qi * uk + qk * ui);
   state->q[3] += 0.5f * dt * (qw * uk + qi * uj - qj * ui);
-  // normalize, need it so the flight calculation doesn't shrink to zero
+  // normalize, need it so the quaternion coordinate doesn't shrink to zero
   // bum ass rounding error why is 0.1+0.2 = 0.3000001 this is :/
-  float msg = sqrtf(state->q[0] * state->q[0] + state->q[1] * state->q[1] +
-                    state->q[2] * state->q[2] + state->q[3] * state->q[3]);
-  state->q[0] /= msg;
-  state->q[1] /= msg;
-  state->q[2] /= msg;
-  state->q[3] /= msg;
+  float q_mag = sqrtf(state->q[0] * state->q[0] + state->q[1] * state->q[1] +
+                      state->q[2] * state->q[2] + state->q[3] * state->q[3]);
+  state->q[0] /= q_mag;
+  state->q[1] /= q_mag;
+  state->q[2] /= q_mag;
+  state->q[3] /= q_mag;
 }
 void EKF_Update(EKF_State_t *state, float ai, float aj, float ak) {
   // normalize data - convert from m/s² to g-units
@@ -474,46 +471,58 @@ void EKF_Update(EKF_State_t *state, float ai, float aj, float ak) {
   float qk = state->q[3];
   // predict gravity direction in body frame
   // FlightGear: Z-up, so gravity is in -Z direction
-  float hi = 2.0f * (qi * qk - qw * qj);
-  float hj = 2.0f * (qw * qi + qj * qk);
-  float hk =
-      -(qw * qw - qi * qi - qj * qj + qk * qk); // Negate for Z-up convention
-  // error vector
-  float ex = (hj * ak - hk * aj);
-  float ey = (hk * ai - hi * ak);
-  float ez = (hi * aj - hj * ai);
-  float P_angle = state->P[0][0]; // Uncertainty in orientation
-  float P_bias = state->P[4][4];  // Uncertainty in bias
+  float gx = 2.0f * (qw * qk - qi * qj);
+  float gy = 2.0f * (qi * qw + qk * qj);
+  float gz = (qw * qw - qi * qi - qj * qj + qk * qk);
+  // error vector predicted x accelerator values
+  float e[3];
+  e[0] = (gy * ak - gz * aj);
+  e[1] = (gz * ai - gx * ak);
+  e[2] = (gx * aj - gy * ai);
+
+  float P_angle[3] = {state->P[IND_ANGLE_X][IND_ANGLE_X],
+                      state->P[IND_ANGLE_Y][IND_ANGLE_Y],
+                      state->P[IND_ANGLE_Z][IND_ANGLE_Z]};
+
+  float P_bias[3] = {state->P[IND_BIAS_X][IND_BIAS_X],
+                     state->P[IND_BIAS_Y][IND_BIAS_Y],
+                     state->P[IND_BIAS_Z][IND_BIAS_Z]};
   // measurement noise
   float R_accel = 0.05f;
-  // k value for which to trust
-  float K_angle = P_angle / (P_angle + R_accel);
-  float K_bias = P_bias / (P_bias + R_accel);
+
+  float K_angle[3];
+  float K_bias[3];
+  for (int i = 0; i < 3; ++i) {
+    K_angle[i] = P_angle[i] / (P_angle[i] + R_accel);
+    K_bias[i] = P_bias[i] / (P_bias[i] + R_accel);
+  }
+
   // half of error with K values multiplied
-  float half_ex = 0.5f * ex * K_angle;
-  float half_ey = 0.5f * ey * K_angle;
-  float half_ez = 0.5f * ez * K_angle;
+  float half_e[3];
+  for (int i = 0; i < 3; ++i) {
+    half_e[i] = 0.5f * e[i] * K_angle[i];
+  }
   // update quaternion orientation with error
-  state->q[0] += (-qi * half_ex - qj * half_ey - qk * half_ez);
-  state->q[1] += (qw * half_ex + qj * half_ez - qk * half_ey);
-  state->q[2] += (qw * half_ey - qi * half_ez + qk * half_ex);
-  state->q[3] += (qw * half_ez + qi * half_ey - qj * half_ex);
+  state->q[0] += (-qi * half_e[0] - qj * half_e[1] - qk * half_e[2]);
+  state->q[1] += (qw * half_e[0] + qj * half_e[2] - qk * half_e[1]);
+  state->q[2] += (qw * half_e[1] - qi * half_e[2] + qk * half_e[0]);
+  state->q[3] += (qw * half_e[2] + qi * half_e[1] - qj * half_e[0]);
   // gyro bias correction (drifting)
-  state->bias[0] += -ex * K_bias * 0.01f; // Small learning rate
-  state->bias[1] += -ey * K_bias * 0.01f;
-  state->bias[2] += -ez * K_bias * 0.01f;
+  for (int i = 0; i < 3; ++i) {
+    state->bias[i] += e[i] * K_bias[i] * 0.01f; // small learning curve
+  }
   // reduce uncertainty
-  state->P[0][0] -= K_angle * state->P[0][0];
-  state->P[1][1] -= K_angle * state->P[1][1];
-  state->P[2][2] -= K_angle * state->P[2][2];
-  state->P[3][3] -= K_angle * state->P[3][3];
+  for (int i = 0; i < 3; ++i) {
+    state->P[i][i] *= (1.0f - K_angle[i]);
+    state->P[i + 3][i + 3] *= (1.0f - K_bias[i]);
+  }
   // normalize for fp calculation
   float mag = sqrtf(state->q[0] * state->q[0] + state->q[1] * state->q[1] +
                     state->q[2] * state->q[2] + state->q[3] * state->q[3]);
   state->q[0] /= mag;
   state->q[1] /= mag;
   state->q[2] /= mag;
-  state->q[3] /= mag;
+  state->q[3] /= mag; // normalization
 }
 // initalize EKF
 void EKF_Init(EKF_State_t *state) {
@@ -527,41 +536,131 @@ void EKF_Init(EKF_State_t *state) {
   state->bias[1] = 0.0f;
   state->bias[2] = 0.0f;
   // intialize covariance (diagonal ekf)
-  for (int i = 0; i < 7; i++) {
-    for (int j = 0; j < 7; j++) {
-      state->P[i][j] = (i == j) ? 1.0f : 0.0f;
-    }
-  }
-  // INitialize PID state
-  state->roll_integral = 0.0f;
-  state->pitch_integral = 0.0f;
-  state->yaw_integral = 0.0f;
-  state->last_roll_error = 0.0f;
-  state->last_pitch_error = 0.0f;
-  state->last_yaw_error = 0.0f;
+  state->P[0][0] = 0.1f;
+  state->P[1][1] = 0.1f;
+  state->P[2][2] = 0.1f;
+
+  // gyro bias uncertainty
+  state->P[3][3] = 1e-4f;
+  state->P[4][4] = 1e-4f;
+  state->P[5][5] = 1e-4f;
+  state->PID KP_R = 1.0f; // Roll proportional gain
+  state->PID KI_R = 0.0f; // Unused
+  state->PID KD_R = 0.0f; // Unused
+
+  state->PID KP_P = 1.0f; // Pitch proportional gain
+  state->PID KI_P = 0.0f; // Unused
+  state->PID KD_P = 0.0f; // Unused
+
+  state->PID KP_Y = 0.0f; // No yaw control yet
+  state->PID KI_Y = 0.0f;
+  state->PID KD_Y = 0.0f;
+}
+
+void quaternion_to_body_x(float q[4], float x_body[3]) {
+  float qw = q[0], qi = q[1], qj = q[2], qk = q[3];
+  x_body[0] = 1.0f - 2.0f * (qj * qj + qk * qk);
+  x_body[1] = 2.0f * (qi * qj + qw * qk);
+  x_body[2] = 2.0f * (qi * qk - qw * qj);
+}
+
+void quaternion_to_body_y(float q[4], float y_body[3]) {
+  float qw = q[0], qi = q[1], qj = q[2], qk = q[3];
+  y_body[0] = 2.0f * (qi * qj - qw * qk);
+  y_body[1] = 1.0f - 2.0f * (qi * qi + qk * qk);
+  y_body[2] = 2.0f * (qj * qk + qw * qi);
+}
+
+float compute_aileron(EKF_State_t *state) {
+  float y_body[3];
+  quaternion_to_body_y(state->q, y_body);
+
+  // Roll error: y_body[2] tells how much right wing is up/down
+  // Positive = right wing down, negative = right wing up
+  float roll_error = -y_body[2];
+
+  // Proportional gain
+  float Kp = state->PID KP_R;
+
+  // Aileron command
+  float aileron = Kp * roll_error;
+
+  // Clamp to ±1.0
+  if (aileron > 1.0f)
+    aileron = 1.0f;
+  if (aileron < -1.0f)
+    aileron = -1.0f;
+
+  return aileron;
+}
+
+float compute_elevator(EKF_State_t *state) {
+  float x_body[3];
+  quaternion_to_body_x(state->q, x_body);
+
+  // Pitch error: x_body[2] tells how much nose is up/down
+  // Positive = nose up, negative = nose down
+  float pitch_error = x_body[2];
+
+  // Proportional gain
+  float Kp = state->PID KP_P;
+
+  // Elevator command
+  float elevator = Kp * pitch_error;
+
+  // Clamp to ±1.0
+  if (elevator > 1.0f)
+    elevator = 1.0f;
+  if (elevator < -1.0f)
+    elevator = -1.0f;
+
+  return elevator;
 }
 
 // function that runs when rx_byte arrives
-/* USER CODE BEGIN 4 */
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
-  if (huart->Instance == USART2) {
-    if (rx_byte == '\n') {
-      rx_buffer[rx_index] = '\0';
-      data_ready = 1;
-      rx_index = 0;
-    } else {
-      if (rx_index < 127) { // <--- Add this safety belt back
-        rx_buffer[rx_index++] = rx_byte;
-      }
+void process_rx_data(uint16_t old_pos, uint16_t new_pos) {
+  static char line[MESSAGE_LEN];
+  static uint16_t idx = 0;
+
+  while (old_pos != new_pos) {
+    char c = rx_dma_buf[old_pos++];
+    if (old_pos >= RX_DMA_SIZE) {
+      old_pos = 0; // Wrap around
     }
-    HAL_UART_Receive_IT(&huart2, &rx_byte, 1);
+
+    if (c == '\n') {
+      line[idx] = '\0';
+      memcpy((void *)rx_buffer, line, idx + 1);
+      data_ready = 1; // Overwrite old packet - newest wins!
+      idx = 0;
+    } else if (idx < MESSAGE_LEN - 1) {
+      line[idx++] = c;
+    }
   }
 }
 
-void logging(char *log_msg) {
-  char out_msg[MESSAGE_LEN];
-  snprintf(out_msg, sizeof(out_msg), "%s\n", log_msg);
-  HAL_UART_Transmit(&huart1, (uint8_t *)out_msg, strlen(out_msg), 10);
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart) {
+  if (huart->Instance == USART2) {
+    uart2_tx_busy = 0;
+  } else if (huart->Instance == USART1) {
+    uart1_tx_busy = 0;
+  }
+}
+
+void uart_output(uint8_t port, char *msg) {
+  if (port == 1) {
+    if (uart1_tx_busy)
+      return;
+    uart1_tx_busy = 1;
+    int len = snprintf(uart1_tx_buffer, sizeof(uart1_tx_buffer), "%s\n", msg);
+    HAL_UART_Transmit_DMA(&huart1, (uint8_t *)uart1_tx_buffer, len);
+  } else if (port == 2) {
+    if (uart2_tx_busy)
+      return;
+    uart2_tx_busy = 1;
+    int len = snprintf(uart2_tx_buffer, sizeof(uart2_tx_buffer), "%s", msg);
+    HAL_UART_Transmit_DMA(&huart2, (uint8_t *)uart2_tx_buffer, len);
+  }
 }
 /* USER CODE END 4 */
 
@@ -571,7 +670,8 @@ void logging(char *log_msg) {
  */
 void Error_Handler(void) {
   /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
+  /* User can add his own implementation to report the HAL error return state
+   */
   __disable_irq();
   while (1) {
   }
@@ -588,8 +688,8 @@ void Error_Handler(void) {
 void assert_failed(uint8_t *file, uint32_t line) {
   /* USER CODE BEGIN 6 */
   /* User can add his own implementation to report the file name and line
-     number, ex: printf("Wrong parameters value: file %s on line %d\r\n", file,
-     line) */
+     number, ex: printf("Wrong parameters value: file %s on line %d\r\n",
+     file, line) */
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */

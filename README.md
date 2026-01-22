@@ -1,40 +1,38 @@
 # Phantom Autopilot
 
-Real-time quaternion-based flight orientation visualization system for STM32F411 microcontroller.
+Hardware-accelerated flight control system using Extended Kalman Filter for real-time attitude estimation on STM32F411 microcontroller.
 
 ![Flight Orientation Visualization](Screenshot%20from%202026-01-14%2015-38-48.png)
 
 ## Overview
 
-This project captures and visualizes 3D flight orientation data from an STM32F411 microcontroller in real-time. The system outputs quaternion data via UART, which is then visualized as a rotating 3D box using Python and Matplotlib.
+This project implements a real-time quaternion-based Extended Kalman Filter (EKF) for flight attitude estimation and control. The STM32F411 processes IMU data from FlightGear simulator, computes optimal orientation estimates, and outputs control commands to stabilize the aircraft.
 
-## Features
+**For detailed technical documentation, debugging challenges, and implementation notes, see [DEVLOG.md](DEVLOG.md).**
 
-- 📡 **Real-time serial communication** - Reads quaternion data from STM32 via UART
-- 📦 **3D visualization** - Displays flight orientation as a color-coded 3D box
-- 🎯 **Coordinate system display** - Visual reference axes (X/Y/Z)
-- 🔄 **Live updates** - ~20 FPS visualization refresh rate
-- 🎨 **Color-coded faces** - Each face has distinct colors for easy orientation tracking
+## Key Features
 
-## Hardware Requirements
+- Custom Extended Kalman Filter implementation with quaternion-based attitude representation
+- Circular DMA for low-latency sensor data streaming
+- Proportional control for aileron and elevator surfaces
+- Real-time 3D visualization using Python and Matplotlib
+- Non-blocking UART communication architecture
+- Gimbal lock avoidance through quaternion mathematics
 
-- STM32F411RETx microcontroller
-- USB-to-Serial adapter (or ST-Link with virtual COM port)
-- Flight controller or IMU sensor (for quaternion data generation)
+## System Architecture
 
-## Software Requirements
+### Hardware
 
-### STM32 Firmware
+- **Microcontroller:** STM32F411RETx (Cortex-M4F, 100MHz, 512KB Flash)
+- **Debugger:** ST-Link V2 with JTAG
+- **Communication:** Dual UART (USART1: debug telemetry, USART2: FlightGear interface)
 
-- STM32CubeIDE 2.0.0 or later
-- STM32F4 HAL Driver
-- UART configured for data transmission
+### Software Stack
 
-### Python Visualization
-
-```bash
-pip install pyserial matplotlib numpy
-```
+- **IDE:** STM32CubeIDE 2.0.0
+- **HAL:** STM32F4xx Hardware Abstraction Layer
+- **Algorithms:** Extended Kalman Filter, quaternion kinematics, PID control
+- **Simulator:** FlightGear (IMU data source)
 
 ## Project Structure
 
@@ -59,136 +57,152 @@ phantom_autopilot/
 └── README.md
 ```
 
-## Usage
+## Quick Start
 
-### 1. Flash STM32 Firmware
-
-1. Open the project in STM32CubeIDE
-2. Build the project (Ctrl+B)
-3. Flash to your STM32F411 board
-4. Ensure UART is configured and connected
-
-### 2. Run Visualization
-
-```bash
-python quaternion_visual.py
-```
-
-The script will:
-
-1. List available serial ports
-2. Prompt you to select your device
-3. Open a 3D visualization window
-4. Display the rotating box based on incoming quaternion data
-
-### 3. Data Format
-
-The STM32 should output quaternion data via UART in CSV format:
-
-```
-w, x, y, z
-```
-
-Example:
-
-```
-0.2454, -0.1136, -0.9061, -0.3252
-0.2491, -0.1211, -0.9083, -0.3134
-```
-
-**Quaternion format:** `[w, x, y, z]` (scalar-first convention)
-
-## Configuration
-
-### Serial Port Settings
-
-Default baudrate: **115200**
-
-To change the port or baudrate, edit `quaternion_visual.py`:
-
-```python
-visualizer = QuaternionVisualizer(port='/dev/ttyUSB0', baudrate=115200)
-```
-
-### Box Dimensions
-
-To modify the visualization box size, edit the `create_box_vertices()` function:
-
-```python
-w, h, d = 2.0, 0.5, 1.0  # width, height, depth
-```
-
-## Visualization Details
-
-### Color Scheme
-
-- **Cyan** - Bottom face
-- **Yellow** - Top face
-- **Red** - Front face
-- **Green** - Back face
-- **Blue** - Left face
-- **Magenta** - Right face
-
-### Coordinate System
-
-- **Red axis** - X (Forward)
-- **Green axis** - Y (Right)
-- **Blue axis** - Z (Up)
-
-## Development
-
-### Building the Firmware
+### 1. Build and Flash Firmware
 
 ```bash
 cd /home/sihoon/STM32CubeIDE/workspace_2.0.0/phantom_autopilot
 make -C Debug/
-```
-
-### Flashing
-
-Use ST-Link or your preferred flashing tool:
-
-```bash
 st-flash write Debug/phantom_autopilot.bin 0x8000000
 ```
 
-## Troubleshooting
+Or use STM32CubeIDE:
 
-### No Serial Ports Found
+1. Open project
+2. Build (Ctrl+B)
+3. Run/Debug (F11)
 
-- Check USB connection
-- Verify driver installation (CH340, FTDI, or ST-Link VCP)
-- On Linux: ensure user is in `dialout` group
-  ```bash
-  sudo usermod -a -G dialout $USER
-  ```
+### 2. Run FlightGear Simulator
 
-### Visualization Not Updating
+The STM32 expects sensor data in CSV format via UART:
 
-- Verify STM32 is sending data (check with serial monitor)
-- Confirm baudrate matches between STM32 and Python script
-- Check quaternion data format matches `[w, x, y, z]`
+```
+sim_time, ax, ay, az, gx, gy, gz\n
+```
 
-### Permission Denied on Linux
+### 3. Visualize Orientation (Optional)
 
 ```bash
-sudo chmod 666 /dev/ttyUSB0  # or your specific port
+pip install pyserial matplotlib numpy
+python quaternion_visual.py
 ```
+
+## Technical Documentation
+
+This README provides a quick overview. For in-depth technical details, see:
+
+**[DEVLOG.md](DEVLOG.md)** - Engineering notebook with:
+
+- Detailed problem analysis and solutions
+- EKF implementation details
+- DMA architecture and optimization
+- Debugging methodologies
+- Performance tuning strategies
+
+## Data Protocol
+
+### Input (USART2 RX)
+
+CSV format from FlightGear:
+
+```
+0.025, 0.0, 0.0, -9.81, 0.01, -0.02, 0.00
+```
+
+Fields: `sim_time, ax, ay, az, gx, gy, gz`
+
+### Output (USART2 TX)
+
+Control commands:
+
+```
+aileron, elevator\n
+```
+
+Range: [-1.0, 1.0]
+
+### Debug (USART1 TX)
+
+Telemetry data:
+
+```
+qw, qi, qj, qk, ax, ay, az, gx, gy, gz, sim_time, dt\n
+```
+
+## Project Structure
+
+```
+phantom_autopilot/
+├── Core/
+│   ├── Inc/                    # Header files
+│   │   ├── main.h             # Application definitions
+│   │   ├── stm32f4xx_hal_conf.h
+│   │   └── stm32f4xx_it.h     # Interrupt handlers
+│   ├── Src/                    # Source files
+│   │   ├── main.c              # EKF, control loops, UART
+│   │   ├── stm32f4xx_it.c      # DMA/UART ISRs
+│   │   └── system_stm32f4xx.c
+│   └── Startup/
+├── Drivers/                    # STM32 HAL drivers
+├── Debug/                      # Build artifacts
+├── quaternion_visual.py        # Python visualization
+├── phantom_autopilot.ioc       # CubeMX config
+├── DEVLOG.md                   # Engineering notebook
+└── README.md
+```
+
+## Configuration
+
+### UART Settings
+
+- **Baudrate:** 115200
+- **Data bits:** 8
+- **Stop bits:** 1
+- **Parity:** None
+- **Flow control:** None
+
+### EKF Parameters
+
+Tunable in `main.c`:
+
+- Process noise (Q)
+- Measurement noise (R)
+- Initial covariance (P)
+
+### Control Gains
+
+PID gains stored in `state->PID` array (currently P-only control).
+
+## Troubleshooting
+
+### Common Issues
+
+**Problem:** No serial communication  
+**Solution:** Check UART connections, verify baudrate, ensure ST-Link virtual COM port is enabled
+
+**Problem:** EKF diverges to NaN  
+**Solution:** Check dt calculation, verify quaternion normalization, ensure sensor data is valid
+
+**Problem:** Control lag  
+**Solution:** Verify circular DMA is configured, check for blocking operations in main loop
+
+**Problem:** Permission denied (Linux)  
+**Solution:** `sudo usermod -a -G dialout $USER` then logout/login
+
+For detailed debugging strategies, see [DEVLOG.md](DEVLOG.md).
+
+## References
+
+- Madgwick, S. O. H. (2010). "An efficient orientation filter for inertial and inertial/magnetic sensor arrays"
+- STM32F4xx Reference Manual (RM0383)
+- ARM Cortex-M4 Technical Reference Manual
 
 ## License
 
-This project is open source and available for educational and research purposes.
-
-## Acknowledgments
-
-- STM32 HAL Library by STMicroelectronics
-- Matplotlib for 3D visualization capabilities
-- PySerial for serial communication
-
-## Author
-
-Developed for real-time flight dynamics visualization and autopilot development.
+Open source - available for educational and research purposes.
 
 ---
 
-**Note:** This project is designed for educational purposes and flight simulation testing. Ensure proper safety measures when using with actual flight hardware.
+**Status:** Active development - Performance optimization phase  
+**Last Updated:** January 22, 2026

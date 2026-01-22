@@ -213,7 +213,7 @@ class QuaternionVisualizer:
         
         # Apply rotation to airplane
         R = quaternion_to_rotation_matrix(self.quaternion)
-        rotated_vertices = np.dot(self.airplane_vertices, R.T)
+        rotated_vertices = np.dot(self.airplane_vertices, R)
         
         # Create faces
         faces = create_airplane_faces(rotated_vertices)
